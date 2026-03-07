@@ -1,4 +1,4 @@
-// Ocaml Example // 
+(* Ocaml code exmaple *) 
 
 let x = 0;
 while (x < 5) {
