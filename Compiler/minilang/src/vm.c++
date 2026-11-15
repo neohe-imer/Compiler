@@ -2,72 +2,85 @@
 #include <iostream>
 #include <stdexcept>
 
-static uint16_t readU16(const std::vector<uint8_t>& code, size_t& ip) {
-  uint16_t lo = code[ip++];
-  uint16_t hi = code[ip++];
-  return (uint16_t)(lo | (hi << 8));
-}
-
-void VM::run(const Chunk& chunk) {
+void VM::run(const CompiledProgram& prog) {
   stack_.clear();
-  size_t ip = 0;
+  globals_.clear();
 
-  auto& code = chunk.code;
+  const auto& code = prog.chunk.code;
+  const auto& consts = prog.chunk.constants;
+  const auto& pool = prog.namePool;
+
+  size_t ip = 0;
+  auto readU16 = [&](size_t& ipRef) -> uint16_t {
+    if (code.size() - ipRef < 2) throw std::runtime_error("Truncated bytecode operand");
+    uint16_t lo = code[ipRef++];
+    uint16_t hi = code[ipRef++];
+    return (uint16_t)(lo | (hi << 8));
+  };
+  auto readI16 = [&](size_t& ipRef) -> int32_t {
+    const auto raw = readU16(ipRef);
+    return raw < 0x8000 ? raw : static_cast<int32_t>(raw) - 0x10000;
+  };
+
+  auto jump = [&](int32_t offset) {
+    const auto target = static_cast<int64_t>(ip) + offset;
+    if (target < 0 || static_cast<uint64_t>(target) >= code.size())
+      throw std::runtime_error("Invalid bytecode jump target");
+    ip = static_cast<size_t>(target);
+  };
+
   while (ip < code.size()) {
-    auto op = (Op)code[ip++];
+    Op op = (Op)code[ip++];
 
     switch (op) {
       case Op::CONST: {
-        uint16_t idx = readU16(code, ip);
-        push(chunk.constants[idx]);
+        uint16_t idx = readU16(ip);
+        push(consts.at(idx));
       } break;
 
       case Op::LOAD: {
-        uint16_t nameIdx = readU16(code, ip);
-        // constant at nameIdx is stored as number/bool only in this toy,
-        // so we store variable names as a trick: number is invalid here.
-        // We'll encode names via a separate mechanism in compiler (see compiler.cpp).
-        // For simplicity, we actually store variable names as NaN-boxed? No.
-        // We'll store names in a parallel table: in this demo, LOAD/STORE operands are indices into a name pool
-        // kept in constants as numbers is not possible.
-        // => We'll instead have compiler encode names in constants as "bool" with side channel? Not.
-        // To keep this file clean, we let compiler map nameIdx -> string by placing it in globals_ key list order.
-        // In practice you should store strings in Value. (See compiler.cpp comment.)
-        throw std::runtime_error("LOAD not wired: use STORE/LOAD via name pool in compiler.cpp (see compiler.cpp).");
+        uint16_t nameIdx = readU16(ip);
+        const std::string& name = pool.at(nameIdx);
+        auto it = globals_.find(name);
+        if (it == globals_.end()) throw std::runtime_error("Undefined variable: " + name);
+        push(it->second);
       } break;
 
       case Op::STORE: {
-        throw std::runtime_error("STORE not wired: use name pool in compiler.cpp (see compiler.cpp).");
+        uint16_t nameIdx = readU16(ip);
+        const std::string& name = pool.at(nameIdx);
+        auto v = pop();
+        globals_[name] = v;
+        // keep it simple: STORE does not push anything back
       } break;
 
-      case Op::ADD: { auto b = pop(); auto a = pop(); push(Value::num(a.asNum() + b.asNum())); } break;
-      case Op::SUB: { auto b = pop(); auto a = pop(); push(Value::num(a.asNum() - b.asNum())); } break;
-      case Op::MUL: { auto b = pop(); auto a = pop(); push(Value::num(a.asNum() * b.asNum())); } break;
-      case Op::DIV: { auto b = pop(); auto a = pop(); push(Value::num(a.asNum() / b.asNum())); } break;
+      case Op::ADD: binNum([](double a,double b){return a+b;}); break;
+      case Op::SUB: binNum([](double a,double b){return a-b;}); break;
+      case Op::MUL: binNum([](double a,double b){return a*b;}); break;
+      case Op::DIV: binNum([](double a,double b){return a/b;}); break;
 
       case Op::NEG: { auto a = pop(); push(Value::num(-a.asNum())); } break;
 
-      case Op::EQ: { auto b = pop(); auto a = pop(); push(Value::boolean(a.asNum() == b.asNum())); } break;
-      case Op::NE: { auto b = pop(); auto a = pop(); push(Value::boolean(a.asNum() != b.asNum())); } break;
-      case Op::LT: { auto b = pop(); auto a = pop(); push(Value::boolean(a.asNum() <  b.asNum())); } break;
-      case Op::LE: { auto b = pop(); auto a = pop(); push(Value::boolean(a.asNum() <= b.asNum())); } break;
-      case Op::GT: { auto b = pop(); auto a = pop(); push(Value::boolean(a.asNum() >  b.asNum())); } break;
-      case Op::GE: { auto b = pop(); auto a = pop(); push(Value::boolean(a.asNum() >= b.asNum())); } break;
+      case Op::EQ: cmpNum([](double a,double b){return a==b;}); break;
+      case Op::NE: cmpNum([](double a,double b){return a!=b;}); break;
+      case Op::LT: cmpNum([](double a,double b){return a<b;}); break;
+      case Op::LE: cmpNum([](double a,double b){return a<=b;}); break;
+      case Op::GT: cmpNum([](double a,double b){return a>b;}); break;
+      case Op::GE: cmpNum([](double a,double b){return a>=b;}); break;
 
       case Op::NOT: { auto a = pop(); push(Value::boolean(!a.asBool())); } break;
-
       case Op::AND: { auto b = pop(); auto a = pop(); push(Value::boolean(a.asBool() && b.asBool())); } break;
       case Op::OR:  { auto b = pop(); auto a = pop(); push(Value::boolean(a.asBool() || b.asBool())); } break;
 
       case Op::JMP: {
-        uint16_t offset = readU16(code, ip);
-        ip += offset;
+        int32_t off = readI16(ip);
+        jump(off);
       } break;
 
       case Op::JMP_IF_FALSE: {
-        uint16_t offset = readU16(code, ip);
+        int32_t off = readI16(ip);
         auto cond = pop();
-        if (!cond.asBool()) ip += offset;
+        if (!cond.asBool()) jump(off);
       } break;
 
       case Op::PRINT: {
@@ -76,9 +89,9 @@ void VM::run(const Chunk& chunk) {
       } break;
 
       case Op::POP: { (void)pop(); } break;
-
-      case Op::HALT:
-        return;
+      case Op::HALT: return;
+      default: throw std::runtime_error("Invalid bytecode opcode");
     }
   }
+  throw std::runtime_error("Bytecode missing HALT");
 }

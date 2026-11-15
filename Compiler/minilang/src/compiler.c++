@@ -1,38 +1,43 @@
 #include "compiler.h"
 #include <stdexcept>
+#include <limits>
 
 uint16_t Compiler::nameIndex(const std::string& name) {
   auto it = nameToIndex_.find(name);
   if (it != nameToIndex_.end()) return it->second;
-  uint16_t idx = (uint16_t)namePool_.size();
+  if (namePool_.size() > std::numeric_limits<uint16_t>::max())
+    throw std::runtime_error("Too many variable names (maximum 65536)");
+  uint16_t idx = static_cast<uint16_t>(namePool_.size());
   namePool_.push_back(name);
   nameToIndex_[name] = idx;
   return idx;
 }
 
 void Compiler::emitConst(Value v) {
+  if (chunk_.constants.size() > std::numeric_limits<uint16_t>::max())
+    throw std::runtime_error("Too many constants (maximum 65536)");
   int idx = chunk_.addConst(std::move(v));
   chunk_.emit(Op::CONST);
   chunk_.emitU16((uint16_t)idx);
 }
 
-void Compiler::emitJump(Op op, uint16_t offset) {
+size_t Compiler::emitJumpPlaceholder(Op op) {
   chunk_.emit(op);
-  chunk_.emitU16(offset);
-}
-
-uint16_t Compiler::emitJumpPlaceholder(Op op) {
-  chunk_.emit(op);
-  // placeholder offset (0), patch later
-  uint16_t at = (uint16_t)chunk_.code.size();
+  const size_t at = chunk_.code.size();
   chunk_.emitU16(0);
-  return at; // points to the first byte of the u16
+  return at;
 }
 
-// patch offset at position `at` (little endian) to jump from end of operand to target
-void Compiler::patchJump(uint16_t at, uint16_t offsetFromEndOfOperand) {
-  chunk_.code[at]     = (uint8_t)(offsetFromEndOfOperand & 0xFF);
-  chunk_.code[at + 1] = (uint8_t)((offsetFromEndOfOperand >> 8) & 0xFF);
+// Operands are signed 16-bit byte offsets relative to the end of the operand.
+// Positions stay size_t: a large program is valid when each jump fits.
+void Compiler::patchJump(size_t at, size_t target) {
+  const auto offset = static_cast<int64_t>(target) - static_cast<int64_t>(at + 2);
+  if (offset < std::numeric_limits<int16_t>::min() ||
+      offset > std::numeric_limits<int16_t>::max())
+    throw std::runtime_error("Jump exceeds signed 16-bit range");
+  const auto encoded = static_cast<uint16_t>(offset);
+  chunk_.code.at(at) = static_cast<uint8_t>(encoded & 0xff);
+  chunk_.code.at(at + 1) = static_cast<uint8_t>(encoded >> 8);
 }
 
 CompiledProgram Compiler::compile(const std::vector<StmtPtr>& program) {
@@ -79,45 +84,21 @@ void Compiler::compileStmt(const Stmt* s) {
     // jump over else
     auto jmpEndAt = emitJumpPlaceholder(Op::JMP);
 
-    // patch false jump to here
-    {
-      uint16_t afterOperand = (uint16_t)(jmpFalseAt + 2);
-      uint16_t target = (uint16_t)chunk_.code.size();
-      uint16_t offset = (uint16_t)(target - afterOperand);
-      patchJump(jmpFalseAt, offset);
-    }
-
+    patchJump(jmpFalseAt, chunk_.code.size());
     if (i->elseBranch) compileStmt(i->elseBranch.get());
-
-    // patch end jump
-    {
-      uint16_t afterOperand = (uint16_t)(jmpEndAt + 2);
-      uint16_t target = (uint16_t)chunk_.code.size();
-      uint16_t offset = (uint16_t)(target - afterOperand);
-      patchJump(jmpEndAt, offset);
-    }
+    patchJump(jmpEndAt, chunk_.code.size());
     return;
   }
 
   if (auto* w = dynamic_cast<const WhileStmt*>(s)) {
-    uint16_t loopStart = (uint16_t)chunk_.code.size();
-
+    const size_t loopStart = chunk_.code.size();
     compileExpr(w->condition.get());
-    auto exitJumpAt = emitJumpPlaceholder(Op::JMP_IF_FALSE);
-
+    const auto exitJump = emitJumpPlaceholder(Op::JMP_IF_FALSE);
     compileStmt(w->body.get());
-
-    // jump back to loopStart
-    {
-      chunk_.emit(Op::JMP);
-      uint16_t afterOperand = (uint16_t)(chunk_.code.size() + 2);
-      // We want ip += offset, so offset must be negative… but our VM uses unsigned forward jumps.
-      // Trick: implement "back jump" as ip -= backOffset would require a new opcode.
-      // We'll add a BACK_JMP? For simplicity, rewrite as forward by emitting a new Op not present.
-      // Instead: in this portfolio demo, we'll implement back jumps by storing two's complement in u16,
-      // and updating VM to interpret JMP as signed int16.
-    }
-    throw std::runtime_error("While compilation needs signed jumps; see vm runner in main.cpp for signed JMP.");
+    const auto backJump = emitJumpPlaceholder(Op::JMP);
+    patchJump(backJump, loopStart);
+    patchJump(exitJump, chunk_.code.size());
+    return;
   }
 
   throw std::runtime_error("Unknown statement in compiler");
@@ -173,10 +154,27 @@ void Compiler::compileExpr(const Expr* e) {
   }
   if (auto* lo = dynamic_cast<const LogicalExpr*>(e)) {
     compileExpr(lo->left.get());
-    compileExpr(lo->right.get());
-    if (lo->op.type == TokenType::AndAnd) chunk_.emit(Op::AND);
-    else if (lo->op.type == TokenType::OrOr) chunk_.emit(Op::OR);
-    else throw std::runtime_error("Unknown logical op in compiler");
+    const auto falseJump = emitJumpPlaceholder(Op::JMP_IF_FALSE);
+    if (lo->op.type == TokenType::AndAnd) {
+      compileExpr(lo->right.get());
+      // Normalize truthy numbers to a boolean, matching the interpreter.
+      chunk_.emit(Op::NOT);
+      chunk_.emit(Op::NOT);
+      const auto endJump = emitJumpPlaceholder(Op::JMP);
+      patchJump(falseJump, chunk_.code.size());
+      emitConst(Value::boolean(false));
+      patchJump(endJump, chunk_.code.size());
+    } else if (lo->op.type == TokenType::OrOr) {
+      emitConst(Value::boolean(true));
+      const auto endJump = emitJumpPlaceholder(Op::JMP);
+      patchJump(falseJump, chunk_.code.size());
+      compileExpr(lo->right.get());
+      chunk_.emit(Op::NOT);
+      chunk_.emit(Op::NOT);
+      patchJump(endJump, chunk_.code.size());
+    } else {
+      throw std::runtime_error("Unknown logical op in compiler");
+    }
     return;
   }
 

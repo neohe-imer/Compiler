@@ -22,9 +22,8 @@ private:
   uint16_t nameIndex(const std::string& name);
 
   void emitConst(Value v);
-  void emitJump(Op op, uint16_t offset);
-  uint16_t emitJumpPlaceholder(Op op);
-  void patchJump(uint16_t at, uint16_t offsetFromEndOfOperand);
+  size_t emitJumpPlaceholder(Op op);
+  void patchJump(size_t at, size_t target);
 
   void compileStmt(const Stmt* s);
   void compileExpr(const Expr* e);
