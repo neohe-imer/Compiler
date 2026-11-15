@@ -1,9 +1,3 @@
-
----
-
-## 3) src/token.h
-
-```cpp
 #pragma once
 #include <string>
 #include <variant>
@@ -36,4 +30,5 @@ struct Token {
   int line = 1;
   std::variant<std::monostate, double> literal{};
 };
+
 
